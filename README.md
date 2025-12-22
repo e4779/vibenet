@@ -4,8 +4,6 @@
   <img src="https://raw.githubusercontent.com/jaeheonshim/vibenet/refs/heads/main/images/vibenet.png" alt="VibeNet Flow" width="800"/>
 </p>
 
-A while ago I canceled my Spotify subscription and began building my own offline music library. But something I always missed was Spotify's ability to generate smart playlists like *Morning Mix* or *Driving Vibes*. Spotify doesn't publish how its algorithm creates these playlists, so I set out to build my own system.
-
 VibeNet is a lightweight all-in-one Python package, [Beets plugin](https://beets.io/), and command-line tool that predicts musical emotions and attributes (valence, energy, danceability, acousticness, etc.) directly from raw audio. It utilizes a distilled EfficientNet student model trained with teacher-student distillation on the Free Music Archive (FMA) dataset.
 
 To get started, install the VibeNet package.
