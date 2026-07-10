@@ -7,7 +7,6 @@ from beets.importer import ImportTask
 from beets.library import Item, Library
 from beets.plugins import BeetsPlugin
 from beets.ui import Subcommand, should_write
-from beets.util import syspath
 from beets.dbcore import types
 
 from vibenet import labels as FIELDS
@@ -51,7 +50,10 @@ class VibeNetPlugin(BeetsPlugin):
         net = load_model()
         
         def worker(item) -> tuple[Item, dict]:
-            path = syspath(item.filepath)
+            # Use item.filepath directly (absolute pathlib.Path) — do NOT wrap
+            # in syspath(), which strips the library directory prefix and
+            # produces a relative path that load_audio cannot open.
+            path = item.filepath
             wf = load_audio(path, 16000)
             pred = net.predict([wf], 16000)[0]
             scores = pred.to_dict()
