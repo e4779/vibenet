@@ -1,3 +1,4 @@
+import contextvars
 import multiprocessing
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -48,22 +49,31 @@ class VibeNetPlugin(BeetsPlugin):
             self._log.debug("Adjusting max threads to CPU count: {}", threads)
 
         net = load_model()
-        
+
+        # Capture the current contextvars (esp. beets' music_dir ContextVar)
+        # so worker threads inherit it. Without this, item.filepath resolves
+        # via an empty music_dir and returns a relative path → FileNotFoundError.
+        ctx = contextvars.copy_context()
+
         def worker(item) -> tuple[Item, dict]:
-            # Use item.filepath directly (absolute pathlib.Path) — do NOT wrap
-            # in syspath(), which strips the library directory prefix and
-            # produces a relative path that load_audio cannot open.
+            # item.filepath uses beets' music_dir ContextVar to expand the
+            # relative DB path to absolute. The copy_context() above ensures
+            # this works inside ThreadPoolExecutor threads.
             path = item.filepath
             wf = load_audio(path, 16000)
             pred = net.predict([wf], 16000)[0]
             scores = pred.to_dict()
             return item, scores
 
+        def worker_in_context(item):
+            """Run worker with the captured contextvars."""
+            return ctx.run(worker, item)
+
         total = len(items)
         finished = 0
-        
+
         with ThreadPoolExecutor(max_workers=threads) as ex:
-            futs = {ex.submit(worker, it): i for i, it in enumerate(items)}
+            futs = {ex.submit(worker_in_context, it): i for i, it in enumerate(items)}
             for fut in as_completed(futs):
                 idx = futs[fut]
                 
