@@ -51,7 +51,7 @@ class VibeNetPlugin(BeetsPlugin):
         net = load_model()
         
         def worker(item) -> tuple[Item, dict]:
-            path = syspath(item.path)
+            path = syspath(item.filepath)
             wf = load_audio(path, 16000)
             pred = net.predict([wf], 16000)[0]
             scores = pred.to_dict()
@@ -68,7 +68,7 @@ class VibeNetPlugin(BeetsPlugin):
                 try:
                     it, scores = fut.result()
                 except Exception as e:
-                    self._log.error("Error processing {}: {}", items[idx].path, e, exc_info=True)
+                    self._log.error("Error processing {}: {}", items[idx].filepath, e, exc_info=True)
                     continue
                 
                 if not dry_run:
