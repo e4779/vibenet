@@ -1,6 +1,6 @@
-import contextvars
 import multiprocessing
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 import mediafile
 from beets import ui
@@ -17,32 +17,37 @@ from vibenet.core import load_audio
 
 class VibeNetPlugin(BeetsPlugin):
     item_types = {f: types.NullFloat(6) for f in FIELDS}
-    
+
     def __init__(self):
         super().__init__()
-        
+
         self.config.add({
             "threads": 0,
             "auto": True,
             "force": False
         })
-        
+
         self.cfg_threads = self.config['threads'].get(int)
         self.cfg_auto = self.config['auto'].get(bool)
         self.cfg_force = self.config['force'].get(bool)
-        
+
         for name in FIELDS:
             field = mediafile.MediaField(
                 mediafile.MP3DescStorageStyle(name), mediafile.StorageStyle(name)
             )
             self.add_media_field(name, field)
-            
+
         self.import_stages = [self.imported]
-            
-    def _process_items(self, items: list[Item], threads: int, dry_run: bool, write_tags: bool, force: bool):
+
+    def _process_items(
+        self, items: list[Item], threads: int, dry_run: bool, write_tags: bool, force: bool
+    ):
         if not force:
             # Skip items that already have tags
             items = [it for it in items if any(it.get(f) is None for f in FIELDS)]
+
+        if not items:
+            return
 
         if not threads or threads == 0:
             threads = multiprocessing.cpu_count()
@@ -50,100 +55,137 @@ class VibeNetPlugin(BeetsPlugin):
 
         net = load_model()
 
-        # Capture the current contextvars (esp. beets' music_dir ContextVar)
-        # so worker threads inherit it. Without this, item.filepath resolves
-        # via an empty music_dir and returns a relative path → FileNotFoundError.
-        ctx = contextvars.copy_context()
+        # Resolve absolute paths in the MAIN thread before dispatching to
+        # workers.  item.filepath relies on beets' music_dir ContextVar,
+        # which ThreadPoolExecutor workers do NOT inherit (they get a fresh
+        # context with music_dir=b"").  By resolving here we sidestep the
+        # entire contextvars-in-threads problem — no copy_context, no
+        # ctx.run, no race on a shared Context object.
+        tasks: list[tuple[Item, Path]] = []
+        for it in items:
+            path = it.filepath
+            if not path.exists():
+                self._log.error(
+                    "File not found, skipping: {} (filepath={})", it, path
+                )
+                continue
+            tasks.append((it, path))
 
-        def worker(item) -> tuple[Item, dict]:
-            # item.filepath uses beets' music_dir ContextVar to expand the
-            # relative DB path to absolute. The copy_context() above ensures
-            # this works inside ThreadPoolExecutor threads.
-            path = item.filepath
+        if not tasks:
+            self._log.warning("No processable items (all paths missing?)")
+            return
+
+        def worker(path: Path) -> dict:
             wf = load_audio(path, 16000)
             pred = net.predict([wf], 16000)[0]
-            scores = pred.to_dict()
-            return item, scores
+            return pred.to_dict()
 
-        def worker_in_context(item):
-            """Run worker with the captured contextvars."""
-            return ctx.run(worker, item)
-
-        total = len(items)
+        total = len(tasks)
         finished = 0
 
         with ThreadPoolExecutor(max_workers=threads) as ex:
-            futs = {ex.submit(worker_in_context, it): i for i, it in enumerate(items)}
+            futs = {
+                ex.submit(worker, path): (idx, it)
+                for idx, (it, path) in enumerate(tasks)
+            }
             for fut in as_completed(futs):
-                idx = futs[fut]
-                
+                idx, it = futs[fut]
+
                 try:
-                    it, scores = fut.result()
+                    scores = fut.result()
                 except Exception as e:
-                    self._log.error("Error processing {}: {}", items[idx].filepath, e, exc_info=True)
+                    self._log.error(
+                        "Error processing {}: {}", it.filepath, e, exc_info=True
+                    )
                     continue
-                
+
                 if not dry_run:
                     for f in FIELDS:
                         it[f] = float(scores[f])
-                        
+
                     it.store()
-                    
+
                     if write_tags:
                         it.write()
-                
+
                 finished += 1
                 self._log.info(
                     "Progress: [{}/{}] ({} - {} - {})",
-                    str(finished), str(total), it.artist, it.album, it.title,
+                    str(finished),
+                    str(total),
+                    it.artist,
+                    it.album,
+                    it.title,
                 )
-    
+
     def commands(self):
-        cmd = Subcommand("vibenet", help="Predict VibeNet attributes and store them on items.")
-        
-        cmd.parser.add_option(
-            '-d', '--dry-run',
-            action='store_true', dest='dryrun',
-            help="Run predictions but do not save results to the library or files."
+        cmd = Subcommand(
+            "vibenet", help="Predict VibeNet attributes and store them on items."
         )
-        
+
         cmd.parser.add_option(
-            '-w', '--write',
-            action='store_true', dest='write',
-            help="Also write predicted attributes into file tags (not just the beets database)."
+            '-d',
+            '--dry-run',
+            action='store_true',
+            dest='dryrun',
+            help="Run predictions but do not save results to the library or files.",
         )
-        
+
         cmd.parser.add_option(
-            '-t', '--threads',
-            action='store', dest='threads', type='int',
+            '-w',
+            '--write',
+            action='store_true',
+            dest='write',
+            help="Also write predicted attributes into file tags (not just the beets database).",
+        )
+
+        cmd.parser.add_option(
+            '-t',
+            '--threads',
+            action='store',
+            dest='threads',
+            type='int',
             default=self.cfg_threads,
-            help="Number of worker threads to use for predictions."
+            help="Number of worker threads to use for predictions.",
         )
-        
+
         cmd.parser.add_option(
-            '-f', '--force',
-            action='store_true', dest='force',
+            '-f',
+            '--force',
+            action='store_true',
+            dest='force',
             default=self.cfg_force,
-            help="Recompute and overwrite attributes even if they are already present."
+            help="Recompute and overwrite attributes even if they are already present.",
         )
         cmd.func = self._run_cmd
         return [cmd]
-        
+
     def imported(self, _, task: ImportTask) -> None:
         if not self.cfg_auto:
             return
-        
+
         items = list(task.imported_items())
-        self._process_items(items, threads=self.cfg_threads, dry_run=False, write_tags=should_write(), force=self.cfg_force)
-        
+        self._process_items(
+            items,
+            threads=self.cfg_threads,
+            dry_run=False,
+            write_tags=should_write(),
+            force=self.cfg_force,
+        )
+
     def _run_cmd(self, lib: Library, opts, args):
         query = ui.decargs(args)
         items = lib.items(query)
-        
+
         if opts.dryrun:
             self._log.warning("*******************************************")
             self._log.warning("*** DRY RUN: NO CHANGES WILL BE APPLIED ***")
             self._log.warning("*******************************************")
-            
-        self._process_items(items, threads=opts.threads, dry_run=opts.dryrun, write_tags=opts.write, force=opts.force)
-        
+
+        self._process_items(
+            items,
+            threads=opts.threads,
+            dry_run=opts.dryrun,
+            write_tags=opts.write,
+            force=opts.force,
+        )
